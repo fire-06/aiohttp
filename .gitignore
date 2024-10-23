@@ -1,0 +1,27 @@
+# Виртуальные окружения
+env/
+venv/
+__pycache__/
+
+# Файлы конфигурации
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Данные среды
+.env
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# IDE и редакторы
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Логи
+*.log

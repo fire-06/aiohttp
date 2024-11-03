@@ -1,39 +1,74 @@
+import os
 import pydantic
-from flask import Flask, jsonify, request
-from flask.views import MethodView
+from aiohttp import web
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.exc import IntegrityError
-from models import Session, Advert, User
+from sqlalchemy.orm import sessionmaker
+from models import Advert, User, Base
 from shema import CreateAdvert, CreateUser
+from typing import Callable, Awaitable
+from dotenv import load_dotenv
 
-app = Flask('adverts_app')
+load_dotenv()
 
+DB_NAME = os.getenv('DB_NAME', 'adverts.db')
 
-class HttpError(Exception):
-    def __init__(self, status_code: int, description: str):
+DATABASE_URL = f"sqlite+aiosqlite:///{DB_NAME}"
+engine = create_async_engine(DATABASE_URL, echo=True)
+AsyncSessionLocal = sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False
+)
+
+app = web.Application()
+
+# Обработчик ошибок
+class HttpError(web.HTTPException):
+    def __init__(self, status_code: int, reason: str):
         self.status_code = status_code
-        self.description = description
+        super().__init__(reason=reason)
 
 
-@app.errorhandler(HttpError)
-def error_handler(error: HttpError):
-    return jsonify({'error': error.description}), error.status_code
+async def error_middleware(app, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
+    async def middleware_handler(request):
+        try:
+            response = await handler(request)
+            return response
+        except HttpError as err:
+            return web.json_response({'error': err.reason}, status=err.status_code)
+
+    return middleware_handler
+
+app.middlewares.append(error_middleware)
 
 
-@app.before_request
-def before_request():
-    request.session = Session()
+async def init_models():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
-@app.after_request
-def after_request(response):
-    request.session.close()
-    return response
+async def close_session(request: web.Request):
+    session = request['db']
+    await session.close()
 
 
-def get_advert_by_id(advert_id: int) -> Advert:
-    advert = request.session.get(Advert, advert_id)
-    if advert is None:
-        raise HttpError(404, 'Advert not found')
+async def db_session_middleware(app: web.Application, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]):
+    async def middleware_handler(request: web.Request) -> web.StreamResponse:
+        async with AsyncSessionLocal() as session:
+            request['db'] = session
+            response = await handler(request)
+            await close_session(request)
+            return response
+
+    return middleware_handler
+
+app.middlewares.append(db_session_middleware)
+
+
+async def get_advert_by_id(request: web.Request, advert_id: int) -> Advert:
+    session = request['db']
+    advert = await session.get(Advert, advert_id)
+    if not advert:
+        raise HttpError(status_code=404, reason='Advert not found')
     return advert
 
 
@@ -46,51 +81,59 @@ def validate(schema_class, json_data):
         raise HttpError(400, error)
 
 
-def add_instance(instance, conflict_message: str):
+async def add_instance(request, instance, conflict_message: str):
+    session = request['db']
     try:
-        request.session.add(instance)
-        request.session.commit()
+        session.add(instance)
+        await session.commit()
     except IntegrityError:
+        await session.rollback()
         raise HttpError(409, conflict_message)
     return instance
 
 
-class AdvertView(MethodView):
-    def get(self, advert_id: int):
-        advert = get_advert_by_id(advert_id)
-        return jsonify(advert.json)
+class AdvertView(web.View):
+    async def get(self):
+        advert_id = int(self.request.match_info['advert_id'])
+        advert = await get_advert_by_id(self.request, advert_id)
+        return web.json_response(advert.json)
 
-    def post(self):
-        json_data = validate(CreateAdvert, request.json)
+    async def post(self):
+        json_data = validate(CreateAdvert, await self.request.json())
         advert = Advert(**json_data)
-        add_instance(advert, 'Advert already exists')
-        return jsonify(advert.json), 201
+        advert = await add_instance(self.request, advert, 'Advert already exists')
+        return web.json_response(advert.json, status=201)
 
-    def delete(self, advert_id: int):
-        advert = get_advert_by_id(advert_id)
-        request.session.delete(advert)
-        request.session.commit()
-        return jsonify({'status': 'success'})
+    async def delete(self):
+        advert_id = int(self.request.match_info['advert_id'])
+        advert = await get_advert_by_id(self.request, advert_id)
+        session = self.request['db']
+        await session.delete(advert)
+        await session.commit()
+        return web.json_response({'status': 'success'})
 
 
-class UserView(MethodView):
-    def get(self, user_id: int):
-        user = request.session.get(User, user_id)
-        if user is None:
+class UserView(web.View):
+    async def get(self):
+        user_id = int(self.request.match_info['user_id'])
+        session = self.request['db']
+        user = await session.get(User, user_id)
+        if not user:
             raise HttpError(404, "User not found")
-        return jsonify(user.json)
+        return web.json_response(user.json)
 
-    def post(self):
-        json_data = validate(CreateUser, request.json)
+    async def post(self):
+        json_data = validate(CreateUser, await self.request.json())
         user = User(**json_data)
-        add_instance(user, 'User already exists')
-        return jsonify(user.json), 201
+        user = await add_instance(self.request, user, 'User already exists')
+        return web.json_response(user.json, status=201)
 
 
-app.add_url_rule('/advert', view_func=AdvertView.as_view('advert_view'), methods=['POST'])
-app.add_url_rule('/advert/<int:advert_id>', view_func=AdvertView.as_view('advert_detail'), methods=['GET', 'DELETE'])
-app.add_url_rule('/user', view_func=UserView.as_view('user_view'), methods=['POST'])
-app.add_url_rule('/user/<int:user_id>', view_func=UserView.as_view('user_detail'), methods=['GET'])
+app.router.add_view('/advert', AdvertView, name='advert_view')
+app.router.add_view('/advert/{advert_id:\d+}', AdvertView, name='advert_detail')
+app.router.add_view('/user', UserView, name='user_view')
+app.router.add_view('/user/{user_id:\d+}', UserView, name='user_detail')
+
 
 if __name__ == '__main__':
-    app.run()
+    web.run_app(app, host='127.0.0.1', port=8080)
